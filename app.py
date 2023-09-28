@@ -1,17 +1,20 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+load_dotenv()
 from config.celery import make_celery
 import uuid
 import subprocess
 import sys
 import black
-import threading
+import redis
+import json
 
+r = redis.Redis(host="127.0.0.1", port=6379, db=0, password="YBvK2ebMgOQBqd1")
 
 app = Flask(__name__)
 CORS(app)
-
-submissions = {}
 
 celery = make_celery(app)
 
@@ -21,23 +24,30 @@ def execute_python(submission_id, code):
     print("Executing Python code for submission_id:", submission_id)  # Debug print
     if code is None:
         print("Error: Code is None for submission_id:", submission_id)  # Debug print
-        submissions[submission_id] = {
-            "status": "error",
-            "output": {"error": "Code is None"},
-        }
+        r.set(
+            submission_id,
+            json.dumps({"status": "error", "output": {"error": "Code is None"}}),
+        )
         return
     try:
         result = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True, timeout=5
         )
         print("Execution completed for submission_id:", submission_id)  # Debug print
-        submissions[submission_id] = {
-            "status": "completed",
-            "output": {"output": result.stdout, "error": result.stderr},
-        }
+        r.set(
+            submission_id,
+            json.dumps(
+                {
+                    "status": "completed",
+                    "output": {"output": result.stdout, "error": result.stderr},
+                }
+            ),
+        )
     except Exception as e:
         print("Error occurred during execution:", str(e))  # Debug print
-        submissions[submission_id] = {"status": "error", "output": {"error": str(e)}}
+        r.set(
+            submission_id, json.dumps({"status": "error", "output": {"error": str(e)}})
+        )
 
 
 @app.route("/api/submit", methods=["POST"])
@@ -54,16 +64,18 @@ def submit_code():
         return jsonify({"error": "Code is None"}), 400
 
     submission_id = str(uuid.uuid4())
-    submissions[submission_id] = {"status": "pending", "output": None}
+    r.set(submission_id, json.dumps({"status": "pending", "output": None}))
     execute_python.apply_async(args=[submission_id, code])
     return jsonify({"submissionId": submission_id})
 
 
 @app.route("/api/status/<submission_id>", methods=["GET"])
 def check_status(submission_id):
-    submission = submissions.get(submission_id)
-    if not submission:
+    submission_data = r.get(submission_id)
+    if submission_data is None:
         return jsonify({"error": "Submission ID does not exist"}), 404
+
+    submission = json.loads(submission_data.decode("utf-8"))
 
     # if 'pending', return status only
     if submission["status"] == "pending":
@@ -76,10 +88,14 @@ def check_status(submission_id):
 @app.route("/api/results/<submission_id>", methods=["GET"])
 def get_results(submission_id):
     print("Fetching results for submission_id:", submission_id)
-    submission = submissions.get(submission_id)
-    if not submission:
+
+    submission_data = r.get(submission_id)
+    if submission_data is None:
         print("Submission ID does not exist:", submission_id)  # Debug print
         return jsonify({"error": "Submission ID does not exist"}), 404
+
+    submission = json.loads(submission_data.decode("utf-8"))
+
     print("Returning results for submission_id:", submission_id)  # Debug print
 
     result_type = "output"
@@ -109,6 +125,8 @@ def format_python():
         return jsonify({"formatted_code": formatted_code})
     except black.NothingChanged:
         return jsonify({"formatted_code": code})
+    except black.InvalidInput:
+        return jsonify({"error": "Invalid Python code"})
     except Exception as e:
         return jsonify({"error": str(e)})
 
