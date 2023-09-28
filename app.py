@@ -1,17 +1,22 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from config.celery import make_celery
 import uuid
 import subprocess
 import sys
 import black
 import threading
 
+
 app = Flask(__name__)
 CORS(app)
 
 submissions = {}
 
+celery = make_celery(app)
 
+
+@celery.task
 def execute_python(submission_id, code):
     print("Executing Python code for submission_id:", submission_id)  # Debug print
     if code is None:
@@ -50,7 +55,7 @@ def submit_code():
 
     submission_id = str(uuid.uuid4())
     submissions[submission_id] = {"status": "pending", "output": None}
-    threading.Thread(target=execute_python, args=(submission_id, code)).start()
+    execute_python.apply_async(args=[submission_id, code])
     return jsonify({"submissionId": submission_id})
 
 
