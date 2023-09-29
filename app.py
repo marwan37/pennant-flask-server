@@ -1,120 +1,148 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+from IPython.core.interactiveshell import InteractiveShell
+from IPython.utils.capture import capture_output
 from config.celery import make_celery
 import uuid
-import subprocess
-import sys
 import black
 import redis
 import json
-
-r = redis.Redis(host="127.0.0.1", port=6379, db=0, password="YBvK2ebMgOQBqd1")
+import re
+import time
 
 app = Flask(__name__)
 CORS(app)
 
+r = redis.Redis(host="127.0.0.1", port=6379, db=0, password=os.environ.get("REDIS_PW"))
 celery = make_celery(app)
+
+notebook_shells = {}
+
+
+def get_or_create_shell(notebook_id):
+    if notebook_id not in notebook_shells:
+        notebook_shells[notebook_id] = InteractiveShell()
+    return notebook_shells[notebook_id]
+
+
+def clean_traceback(traceback_str):
+    cleaned_traceback = re.sub(r"\x1b\[.*?m", "", traceback_str)
+    lines = cleaned_traceback.split("\n")
+    essential_lines = [line for line in lines if "Traceback" not in line]
+    return "\n".join(essential_lines)
 
 
 @celery.task
-def execute_python(submission_id, code):
-    print("Executing Python code for submission_id:", submission_id)  # Debug print
+def execute_python(submission_id, code, notebook_id):
+    shell = get_or_create_shell(notebook_id)
+    print("EXECUTING TASK")
+
     if code is None:
-        print("Error: Code is None for submission_id:", submission_id)  # Debug print
-        r.set(
+        r.setex(
             submission_id,
-            json.dumps({"status": "error", "output": {"error": "Code is None"}}),
+            300,
+            json.dumps({"status": "error", "output": "Code is None"}),
         )
         return
+
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True, timeout=5
-        )
+        with capture_output() as captured:
+            shell.run_cell(code)
+
+        stdout = captured.stdout
+        stderr = captured.stderr
+
         print("Execution completed for submission_id:", submission_id)  # Debug print
-        r.set(
+        r.setex(
             submission_id,
+            300,
             json.dumps(
                 {
                     "status": "completed",
-                    "output": {"output": result.stdout, "error": result.stderr},
+                    "output": stdout,
                 }
             ),
         )
     except Exception as e:
-        print("Error occurred during execution:", str(e))  # Debug print
-        r.set(
-            submission_id, json.dumps({"status": "error", "output": {"error": str(e)}})
+        r.setex(
+            submission_id,
+            300,
+            json.dumps({"status": "error", "output": str(e)}),
         )
 
 
 @app.route("/api/submit", methods=["POST"])
 def submit_code():
-    data = request.json
-    cells = data.get("cells")
-    if not cells or not isinstance(cells, list) or len(cells) == 0:
-        return jsonify({"error": "No cells provided"}), 400
+    try:
+        data = request.json
+        notebook_id = data.get("notebookId")
+        cells = data.get("cells")
+        print(cells)
+        if not cells or not isinstance(cells, list) or len(cells) == 0:
+            return jsonify({"error": "No cells provided"}), 400
 
-    # EDIT LATER - processing only the first cell for now
-    cell = cells[0]
-    code = cell.get("code")
-    if code is None:
-        return jsonify({"error": "Code is None"}), 400
+        submission_id = str(uuid.uuid4())
+        r.set(submission_id, json.dumps({"status": "pending", "output": None}))
+        execute_python.apply_async(
+            args=[submission_id, cells[0].get("code"), notebook_id]
+        )
 
-    submission_id = str(uuid.uuid4())
-    r.set(submission_id, json.dumps({"status": "pending", "output": None}))
-    execute_python.apply_async(args=[submission_id, code])
-    return jsonify({"submissionId": submission_id})
+        return jsonify({"submissionId": submission_id}), 202
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/notebookstatus/<notebook_id>", methods=["GET"])
+def notebook_status(notebook_id):
+    if notebook_id in notebook_shells:
+        return jsonify({"notebookId": notebook_id, "active": True})
+    else:
+        return jsonify({"error": "Notebook does not exist"}), 404
+
+
+@app.route("/reset/<notebook_id>", methods=["POST"])
+def reset_notebook(notebook_id):
+    if notebook_id in notebook_shells:
+        del notebook_shells[notebook_id]
+        return jsonify({"message": "Context reset!"})
+    else:
+        return (
+            jsonify({"error": "Context could not be reset. Notebook does not exist"}),
+            404,
+        )
 
 
 @app.route("/api/status/<submission_id>", methods=["GET"])
 def check_status(submission_id):
-    submission_data = r.get(submission_id)
-    if submission_data is None:
-        return jsonify({"error": "Submission ID does not exist"}), 404
+    retries = 3  # Number of times to retry
+    delay = 2  # Delay in seconds between each retry
 
-    submission = json.loads(submission_data.decode("utf-8"))
+    for _ in range(retries):
+        submission_data = r.get(submission_id)
+        if submission_data is None:
+            return jsonify({"error": "Submission ID does not exist"}), 404
 
-    # if 'pending', return status only
-    if submission["status"] == "pending":
-        return jsonify({"status": submission["status"]})
+        submission = json.loads(submission_data.decode("utf-8"))
 
-    # not 'pending', return status and results
-    return jsonify({"type": submission["status"], "results": submission["output"]})
+        if submission["status"] != "pending":
+            break  # Exit the loop if the status is not "pending"
 
+        time.sleep(delay)  # Wait for 'delay' seconds before the next iteration
 
-@app.route("/api/results/<submission_id>", methods=["GET"])
-def get_results(submission_id):
-    print("Fetching results for submission_id:", submission_id)
-
-    submission_data = r.get(submission_id)
-    if submission_data is None:
-        print("Submission ID does not exist:", submission_id)  # Debug print
-        return jsonify({"error": "Submission ID does not exist"}), 404
-
-    submission = json.loads(submission_data.decode("utf-8"))
-
-    print("Returning results for submission_id:", submission_id)  # Debug print
-
+    # Your existing logic here
     result_type = "output"
     if submission["status"] == "error":
         result_type = "error"
-    elif submission["status"] == "completed" and submission["output"].get("error"):
-        result_type = "critical"
 
-    results = [
-        {
-            "cellId": submission_id,
-            "type": result_type,
-            "output": submission["output"].get("output")
-            or submission["output"].get("error")
-            or "",
-        }
-    ]
-
-    return jsonify({"results": results})
+    print(submission)
+    print("SUBMISSION OUTPUT", submission["output"])
+    return jsonify({"results": {"type": result_type, "output": submission["output"]}})
 
 
 @app.route("/format-python", methods=["POST"])
