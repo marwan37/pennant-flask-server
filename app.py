@@ -120,8 +120,8 @@ def reset_notebook(notebook_id):
 
 @app.route("/api/status/<submission_id>", methods=["GET"])
 def check_status(submission_id):
-    retries = 3  # Number of times to retry
-    delay = 2  # Delay in seconds between each retry
+    retries = 3
+    delay = 2
 
     for _ in range(retries):
         submission_data = r.get(submission_id)
@@ -131,11 +131,10 @@ def check_status(submission_id):
         submission = json.loads(submission_data.decode("utf-8"))
 
         if submission["status"] != "pending":
-            break  # Exit the loop if the status is not "pending"
+            break
 
-        time.sleep(delay)  # Wait for 'delay' seconds before the next iteration
+        time.sleep(delay)
 
-    # Your existing logic here
     result_type = "output"
     if submission["status"] == "error":
         result_type = "error"
