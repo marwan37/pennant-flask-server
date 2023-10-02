@@ -25,9 +25,33 @@ notebook_shells = {}
 
 
 def get_or_create_shell(notebook_id):
-    if notebook_id not in notebook_shells:
+    shell_data = r.get(notebook_id)
+    if shell_data is None:
+        notebook_shells[notebook_id] = InteractiveShell()
+        r.set(notebook_id, json.dumps({"created": True}))
+    elif notebook_id not in notebook_shells:
+        # recreate the shell if it's not in notebook_shells but is in redis
         notebook_shells[notebook_id] = InteractiveShell()
     return notebook_shells[notebook_id]
+
+
+@app.route("/api/reset/<notebook_id>", methods=["POST"])
+def reset_notebook(notebook_id):
+    shell_data = r.get(notebook_id)
+
+    # Check if notebook_id exists in Redis or notebook_shells
+    if shell_data is None and notebook_id not in notebook_shells:
+        return jsonify({"message": "Notebook already reset or does not exist"}), 200
+
+    # delete from redis
+    if shell_data is not None:
+        r.delete(notebook_id)
+
+    # delete from notebook_shells
+    if notebook_id in notebook_shells:
+        del notebook_shells[notebook_id]
+
+    return jsonify({"message": "Notebook reset"})
 
 
 def clean_traceback(traceback_str):
@@ -38,42 +62,37 @@ def clean_traceback(traceback_str):
 
 
 @celery.task
-def execute_python(submission_id, code, notebook_id):
+def execute_python(submission_id, cells, notebook_id):
     shell = get_or_create_shell(notebook_id)
-    print("EXECUTING TASK")
 
-    if code is None:
-        r.setex(
-            submission_id,
-            300,
-            json.dumps({"status": "error", "output": "Code is None"}),
-        )
-        return
+    aggregated_output = []
 
-    try:
-        with capture_output() as captured:
-            shell.run_cell(code)
+    for cell in cells:
+        cell_id = cell.get("cellId")
+        code = cell.get("code")
+        if code is None:
+            aggregated_output.append(
+                {"cellId": cell_id, "status": "error", "output": "Code is None"}
+            )
+            continue
 
-        stdout = captured.stdout
-        stderr = captured.stderr
+        try:
+            with capture_output() as captured:
+                shell.run_cell(code)
 
-        print("Execution completed for submission_id:", submission_id)  # Debug print
-        r.setex(
-            submission_id,
-            300,
-            json.dumps(
-                {
-                    "status": "completed",
-                    "output": stdout,
-                }
-            ),
-        )
-    except Exception as e:
-        r.setex(
-            submission_id,
-            300,
-            json.dumps({"status": "error", "output": str(e)}),
-        )
+            stdout = captured.stdout
+            stderr = captured.stderr
+
+            aggregated_output.append(
+                {"cellId": cell_id, "status": "completed", "output": stdout}
+            )
+
+        except Exception as e:
+            aggregated_output.append(
+                {"cellId": cell_id, "status": "error", "output": str(e)}
+            )
+
+    r.setex(submission_id, 300, json.dumps(aggregated_output))
 
 
 @app.route("/api/submit", methods=["POST"])
@@ -82,15 +101,16 @@ def submit_code():
         data = request.json
         notebook_id = data.get("notebookId")
         cells = data.get("cells")
-        print(cells)
+        print("SHELLS SUBMIT: ", notebook_shells)
+
         if not cells or not isinstance(cells, list) or len(cells) == 0:
             return jsonify({"error": "No cells provided"}), 400
 
         submission_id = str(uuid.uuid4())
-        r.set(submission_id, json.dumps({"status": "pending", "output": None}))
-        execute_python.apply_async(
-            args=[submission_id, cells[0].get("code"), notebook_id]
-        )
+        initial_status = [{"status": "pending", "output": None} for _ in cells]
+        r.set(submission_id, json.dumps(initial_status))
+
+        execute_python.apply_async(args=[submission_id, cells, notebook_id])
 
         return jsonify({"submissionId": submission_id}), 202
 
@@ -106,18 +126,6 @@ def notebook_status(notebook_id):
         return jsonify({"error": "Notebook does not exist"}), 404
 
 
-@app.route("/reset/<notebook_id>", methods=["POST"])
-def reset_notebook(notebook_id):
-    if notebook_id in notebook_shells:
-        del notebook_shells[notebook_id]
-        return jsonify({"message": "Context reset!"})
-    else:
-        return (
-            jsonify({"error": "Context could not be reset. Notebook does not exist"}),
-            404,
-        )
-
-
 @app.route("/api/status/<submission_id>", methods=["GET"])
 def check_status(submission_id):
     retries = 3
@@ -128,20 +136,26 @@ def check_status(submission_id):
         if submission_data is None:
             return jsonify({"error": "Submission ID does not exist"}), 404
 
-        submission = json.loads(submission_data.decode("utf-8"))
+        submissions = json.loads(submission_data.decode("utf-8"))
+        if not isinstance(submissions, list):
+            return jsonify({"error": "Invalid submission data"}), 500
 
-        if submission["status"] != "pending":
+        all_completed = all(cell["status"] != "pending" for cell in submissions)
+
+        if all_completed:
             break
 
         time.sleep(delay)
 
-    result_type = "output"
-    if submission["status"] == "error":
-        result_type = "error"
+    results = []
+    for cell in submissions:
+        cell_result = {}
+        cell_result["cellId"] = cell["cellId"]
+        cell_result["type"] = "error" if cell["status"] == "error" else "output"
+        cell_result["output"] = cell["output"]
+        results.append(cell_result)
 
-    print(submission)
-    print("SUBMISSION OUTPUT", submission["output"])
-    return jsonify({"results": {"type": result_type, "output": submission["output"]}})
+    return jsonify({"results": results})
 
 
 @app.route("/format-python", methods=["POST"])
