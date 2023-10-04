@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository serves as the remote Python code execution backend for the Pennant notebook application. It uses Flask, Celery, and Redis to handle code execution requests and manage notebook states.
+This repository serves as the remote Python code execution backend for the Pennant notebook application. It uses Flask, Celery, RabbitMQ and Redis to handle code execution requests and manage notebook states.
 
 ## Table of Contents
 
